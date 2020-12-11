@@ -11,11 +11,9 @@ Parameters:
   BackupLambdaBucketARN:
     Description: An S3 Bucket to send backup files from Kinesis DataStream
     Type: String
-    Default: arn:aws:s3:::aws-waf-logs-882222033305-us-east-1
   LambdaBucket:
     Description: An S3 Bucket to store the lambda files
     Type: String
-    Default: security-cf-es-prod
   LambdaBucketKey:
     Description: An S3 Bucket Key to store the lambda files
     Type: String
@@ -39,11 +37,9 @@ Parameters:
   CustomEndpoint:
     Description: Please enter custom domain for your ES endpoint
     Type: String
-    Default: es.nebulainternal.com
   CustomEndpointCertificateArn:
     Description: Please enter certificate ARN to be used on your custom ES endpoint
     Type: String
-    Default: arn:aws:acm:us-east-1:321031481416:certificate/f6325a41-3184-4381-ba3a-c1af26011308
 Resources:
 #VPC Resources (infrastructure)
   VPC:

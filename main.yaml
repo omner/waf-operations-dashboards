@@ -1,0 +1,490 @@
+Description:
+  WAF Operations - Kibana Dashboards for AWS WAF
+
+Parameters:
+  YourEmail:
+    Description: Your e-mail for receiving a temporary password
+    Type: String
+  AdminEmail:
+    Description: Admin e-mail for receiving a temporary password
+    Type: String
+  BackupLambdaBucketARN:
+    Description: An S3 Bucket to send backup files from Kinesis DataStream
+    Type: String
+    Default: arn:aws:s3:::aws-waf-logs-882222033305-us-east-1
+  LambdaBucket:
+    Description: An S3 Bucket to store the lambda files
+    Type: String
+    Default: security-cf-es-prod
+  LambdaBucketKey:
+    Description: An S3 Bucket Key to store the lambda files
+    Type: String
+    Default: lambdas
+  EnvironmentName:
+    Description: An environment name that is prefixed to resource names
+    Type: String
+    Default: wafops
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnetCIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet
+    Type: String
+    Default: 10.0.1.0/24
+  PrivateSubnetCIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet
+    Type: String
+    Default: 10.0.2.0/24
+  CustomEndpoint:
+    Description: Please enter custom domain for your ES endpoint
+    Type: String
+    Default: es.nebulainternal.com
+  CustomEndpointCertificateArn:
+    Description: Please enter certificate ARN to be used on your custom ES endpoint
+    Type: String
+    Default: arn:aws:acm:us-east-1:321031481416:certificate/f6325a41-3184-4381-ba3a-c1af26011308
+Resources:
+#VPC Resources (infrastructure)
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PublicSubnetCIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Ref PrivateSubnetCIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Routes
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Routes
+  DefaultPrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet
+  ESSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-es
+      GroupDescription: "Security group for ElasticSearch"
+      VpcId: !Ref VPC
+  ESSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt ESSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !GetAtt ESSecurityGroup.GroupId
+#Cognito Resources
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${EnvironmentName}-user-pool
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Sub ${EnvironmentName}-user-pool-domain
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${EnvironmentName}-user-pool-client
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub ${EnvironmentName}-identity
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+  UserPoolUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      DesiredDeliveryMediums:
+        - EMAIL
+      UserAttributes:
+        - Name: email
+          Value: !Ref YourEmail
+      Username: !Ref YourEmail
+      UserPoolId: !Ref UserPool
+  AdminUserPoolUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      DesiredDeliveryMediums:
+        - EMAIL
+      UserAttributes:
+        - Name: email
+          Value: !Ref AdminEmail
+      Username: !Ref AdminEmail
+      UserPoolId: !Ref UserPool
+  CognitoAuthorizedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action:
+              - sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: CognitoAuthorizedPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttp*
+                Resource: arn:aws:es:*
+  IdentityPoolRoleMapping:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthorizedRole.Arn
+  ESCognitoRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - es.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/IAMFullAccess
+        - arn:aws:iam::aws:policy/AmazonESCognitoAccess
+      Path: /
+#ElasticSearch Resource
+  ESSLR:
+    Type: AWS::IAM::ServiceLinkedRole
+    Properties:
+      AWSServiceName: es.amazonaws.com
+      Description: 'Role for ES to access resources in my VPC'
+  ElasticsearchDomain:
+    Type: AWS::Elasticsearch::Domain
+    DependsOn: ESSLR
+    Properties:
+      DomainName: !Sub ${EnvironmentName}-es-${AWS::AccountId}
+      ElasticsearchVersion: 7.8
+      ElasticsearchClusterConfig:
+        InstanceCount: 1
+        InstanceType: m5.large.elasticsearch
+      EBSOptions:
+        EBSEnabled: true
+        Iops: 0
+        VolumeSize: 100
+        VolumeType: gp2
+      EncryptionAtRestOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+        CustomEndpointEnabled: true
+        CustomEndpoint: !Ref CustomEndpoint
+        CustomEndpointCertificateArn: !Ref CustomEndpointCertificateArn
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: 0
+      CognitoOptions:
+        Enabled: true
+        IdentityPoolId: !Ref IdentityPool
+        UserPoolId: !Ref UserPool
+        RoleArn: !GetAtt ESCognitoRole.Arn
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: es:*
+            Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${EnvironmentName}-es-${AWS::AccountId}/*
+      VPCOptions:
+        SubnetIds:
+          - !Ref PublicSubnet
+        SecurityGroupIds:
+          - !Ref ESSecurityGroup
+#Custom Resources needed to create Dashboards only.
+  CustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AWSLambdaFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonKinesisFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+        - arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
+      Path: /
+  CustomResourceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-custom-resource
+      Handler: lambda_function.lambda_handler
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ESSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      MemorySize: 256
+      Runtime: python3.7
+      Timeout: 30
+      Role: !GetAtt CustomResourceRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: !Join [ '/', [ !Ref LambdaBucketKey, cr_lambda.zip ] ]
+  CustomResource:
+    Type: Custom::WAFDashboards
+    DependsOn: FirehoseDeliveryStream
+    DependsOn: CustomResourceFunction
+    DependsOn: ElasticsearchDomain
+    Properties:
+      ServiceToken: !GetAtt CustomResourceFunction.Arn
+      es_domain: !GetAtt ElasticsearchDomain.DomainEndpoint
+#LogEnrichment lambda
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonKinesisFullAccess
+        - arn:aws:iam::aws:policy/AWSLambdaFullAccess
+        - arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+      Path: /
+  LogEnrichment:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: aws-waf-logs-enrichment
+      Handler: lambda_function.lambda_handler
+      MemorySize: 512
+      Runtime: python2.7
+      Layers:
+        - !Ref LogEnrLayer
+      Timeout: 60
+      ReservedConcurrentExecutions: 100
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ESSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: !Join [ '/', [ !Ref LambdaBucketKey, enr_lambda.zip ] ]
+  LogEnrLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python2.7
+      Content:
+        S3Bucket: !Ref LambdaBucket
+        S3Key: !Join [ '/', [ !Ref LambdaBucketKey, layer.zip ] ]
+      LayerName: logs-enr-layer
+#KinesisFirehose
+  FirehoseDeliveryStreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - firehose.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonESFullAccess
+        - arn:aws:iam::aws:policy/AWSLambdaFullAccess
+        - arn:aws:iam::aws:policy/AmazonKinesisFirehoseFullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2FullAccess
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn: LogEnrichment
+    DependsOn: ElasticsearchDomain
+    Properties:
+      DeliveryStreamName: !Sub aws-waf-logs-${EnvironmentName}-es
+      DeliveryStreamType: DirectPut
+      ElasticsearchDestinationConfiguration:
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 3
+        DomainARN: !GetAtt ElasticsearchDomain.Arn
+        # CloudWatchLoggingOptions:
+        #   Enabled: true
+        #   LogGroupName: aws-waf-logs-DataStreams
+        #   LogStreamName: wafops-es
+        IndexName: waf-logs
+        TypeName: ""
+        IndexRotationPeriod: OneDay
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt LogEnrichment.Arn
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: "3"
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: "60"
+        RoleARN: !GetAtt FirehoseDeliveryStreamRole.Arn
+        S3BackupMode: AllDocuments
+        S3Configuration:
+          BucketARN: !Ref BackupLambdaBucketARN
+          RoleARN: !GetAtt FirehoseDeliveryStreamRole.Arn
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 30
+          CompressionFormat: GZIP
+        VpcConfiguration:
+          RoleARN: !GetAtt FirehoseDeliveryStreamRole.Arn
+          SecurityGroupIds:
+            - !Ref ESSecurityGroup
+          SubnetIds:
+            - !Ref PublicSubnet
+
+Outputs:
+  VPC:
+    Description: A reference to the created VPC
+    Value: !Ref VPC
+  PublicSubnet:
+    Description: The public subnet
+    Value: !Ref PublicSubnet
+  PrivateSubnet:
+    Description: The private subnet
+    Value: !Ref PrivateSubnet
+  ESSecurityGroup:
+    Description: ES SecurityGroup
+    Value: !Ref ESSecurityGroup
+  NatGateway:
+    Description: Nat Gateway
+    Value: !Ref NatGateway
+  NatGatewayEIP:
+    Description: Nat Gateway Elastic IP
+    Value: !Ref NatGatewayEIP
+  UserPoolId:
+    Description: UserPool::Id
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: UserPoolClient::Id
+    Value: !Ref UserPoolClient
+  IdentityPoolId:
+    Description: IdentityPool::Id
+    Value: !Ref IdentityPool
+  ElasticSearchURL:
+    Description: ElasticSearch URL
+    Value: !GetAtt ElasticsearchDomain.DomainEndpoint
